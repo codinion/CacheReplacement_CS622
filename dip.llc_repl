@@ -1,0 +1,439 @@
+#include "cache.h"
+
+#include <set> 
+#include <iterator> 
+
+#define CONS 64
+#define CONST_SHIFT 5
+#define CONST_MASK  0x1f
+
+#define PSEL_MASK  0x200
+
+#define e 4
+
+
+uint64_t eps = 0;
+
+uint64_t dum = 0;
+
+uint64_t lru_cnt = 0;
+
+uint64_t bip_cnt = 0;
+
+set < uint64_t > cold_lru[CONS]; 
+set < uint64_t > cold_bip[CONS]; 
+
+unsigned long acc1[CONS];
+
+unsigned long acc[CONS];
+
+
+unsigned long bip_ctr[CONS];
+unsigned long lru_ctr[CONS];
+
+unsigned long bip_miss1[CONS];
+unsigned long lru_miss1[100000];
+
+unsigned long bip_miss[CONS];
+unsigned long lru_miss[CONS];
+
+
+unsigned long bip_miss2[CONS];
+unsigned long lru_miss2[100000];
+
+
+
+
+
+
+enum policy
+{
+    BIP_POL,
+    LRU_POL
+};
+
+void CACHE::mru_update(uint32_t set, uint32_t way)
+{
+    // update mru replacement state
+    for (uint32_t i=0; i<LLC_WAY; i++) {
+        if (block[set][i].lru > block[set][way].lru) {
+            block[set][i].lru--;
+        }
+    }
+    block[set][way].lru = LLC_WAY - 1; // promote to the MRU position
+}
+
+class SAMPLER_BLK
+{
+    public :
+        uint8_t valid;
+        uint64_t tag;
+        uint32_t lru;
+
+    SAMPLER_BLK()
+    {
+        valid = 0;
+        tag = 0;
+        lru = 0;
+    }
+
+};
+
+class PSEL_CLASS
+{
+   
+    
+    public :
+
+    uint64_t cnt;
+    uint64_t swi;
+    uint64_t mv = 0x200;
+
+    PSEL_CLASS()
+    {
+        cnt = (1 << 10) + 5;
+        swi = 0;
+        //cout << cnt;
+    }
+
+    void inc()
+    {
+        if(cnt == (1 << 11) - mv - 1)
+        {
+            swi++;
+        }
+        if(cnt < (1 << 11) - mv - 1)
+        {
+            cnt ++;
+        }
+        else
+        {
+            cnt = (1 << 11) - mv - 1;
+        }
+    }
+
+    void dec()
+    {
+         if(cnt == 1024)
+        {
+            swi++;
+        }
+        if(cnt > mv )
+        {
+           // cout << cnt <<endl;
+            cnt --;
+        }
+        else
+        {
+            cnt = mv;
+        }
+    }
+
+    int pol()
+    {
+       // return LRU_POL;
+        
+        if(cnt >= 1024)
+        {
+            //cout << cnt <<" LRU\n";
+            return LRU_POL;
+        }
+        else
+        {
+            //cout << cnt <<" BiP\n";
+            return BIP_POL;
+        }
+    }
+};
+
+
+SAMPLER_BLK smp_lru[CONS][LLC_WAY];
+
+SAMPLER_BLK smp_bip[CONS][LLC_WAY];
+
+PSEL_CLASS psel[CONS];
+
+void CACHE::llc_initialize_replacement()
+{
+    dum = dum + 1;
+    lru_cnt = 0;
+    bip_cnt = 0;
+    ;
+
+    for(int i = 0; i< CONS; i++)
+    {
+        acc[i] = 0;
+        bip_ctr[i] = 0;
+        lru_ctr[i] = 0;
+        bip_miss[i] = 0;
+        lru_miss[i] = 0;
+        bip_miss1[i] = 0;
+        lru_miss1[i] = 0;
+        bip_miss2[i] = 0;
+        lru_miss2[i] = 0;
+
+        for(int j = 0 ; j < LLC_WAY ; j++)
+        {
+            smp_lru[i][j].lru = j;
+            smp_bip[i][j].lru = j;
+        }
+    }
+}
+
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // baseline LRU
+    return lru_victim(cpu, instr_id, set, current_set, ip, full_addr, type); 
+    
+}
+
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // uncomment this line to see the LLC accesses
+    // cout << "CPU: " << cpu << "  LLC " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
+    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+
+    // baseline LRU
+    if (hit && (type == WRITEBACK)) // writeback hit does not update LRU state
+        return;
+
+    uint64_t cons = (set >> CONST_SHIFT);
+
+    if(cons >= 64)
+        assert(0);
+
+    uint64_t olde = eps;
+
+    acc[cons] = acc[cons] + 1;
+
+    if(psel[cons].pol() == LRU_POL)
+    {
+
+        lru_cnt++;
+        lru_ctr[cons]++;
+        lru_update(set,way);
+
+        if(!hit)
+        {
+            lru_miss[cons]++;
+        }
+    }
+    else if(psel[cons].pol() == BIP_POL)
+    {
+        bip_cnt++;
+        bip_ctr[cons]++;
+
+        if(!hit)
+        {
+            bip_miss[cons]++;
+            if(eps)
+            {
+                mru_update(set,way);
+            }
+            else
+            {
+                lru_update(set,way);
+            }
+        }
+        else
+        {
+            lru_update(set,way);
+        }
+        eps = (eps + 1) % (1 << e); 
+    }
+    else
+    {
+        assert(0);
+    }
+
+    if((cons & CONST_MASK) == (set & CONST_MASK))
+    {
+        //lru sampler set
+
+        uint64_t tg = full_addr/(64*LLC_SET);
+
+        if(cold_lru[cons].find(tg) == cold_lru[cons].end())
+        {
+            cold_lru[cons].insert(tg);
+        }
+
+        uint8_t sm_way = 0;
+        //uint8_t miss = 0;
+
+        //check for cache miss
+        for (sm_way=0; sm_way<LLC_WAY; sm_way++)
+        {
+            if (smp_lru[cons][sm_way].valid && smp_lru[cons][sm_way].tag == full_addr / (64*LLC_SET)) {
+                break;
+            }
+        }
+
+        //miss
+        if(sm_way == LLC_WAY){
+            for (sm_way=0; sm_way<LLC_WAY; sm_way++)
+            {
+                if (smp_lru[cons][sm_way].valid == 0) {
+                    break;
+                }
+            }
+
+            if (sm_way == LLC_WAY)
+            {
+                for (sm_way=0; sm_way<LLC_WAY; sm_way++) {
+                    if (smp_lru[cons][sm_way].lru == LLC_WAY-1) {
+                        break;
+                    }
+                }
+                
+            }
+            if (sm_way == LLC_WAY) {
+            cerr << "[" << NAME << "] " << __func__ << " no victim! set: " << cons << endl;
+            assert(0);
+            }
+
+            psel[cons].dec();
+            //cout <<"\nSAMPLE LRU MISS\n";
+            smp_lru[cons][sm_way].valid = 1;
+            smp_lru[cons][sm_way].tag = full_addr/(64*LLC_SET);
+
+
+        }
+
+        for (uint32_t i=0; i<LLC_WAY; i++)
+        {
+            if (smp_lru[cons][i].lru < smp_lru[cons][sm_way].lru)
+            {
+                smp_lru[cons][i].lru++;
+            }
+        }
+        smp_lru[cons][sm_way].lru = 0; // promote to the MRU position
+    }
+    else if((cons & CONST_MASK) == (~set &CONST_MASK))
+    {
+        uint8_t sm_way = 0;
+
+        uint64_t tg = full_addr/(64*LLC_SET);
+
+        if(cold_bip[cons].find(tg) == cold_bip[cons].end())
+        {
+            cold_bip[cons].insert(tg);
+        }
+
+
+        //check for cache miss
+        for (sm_way=0; sm_way<LLC_WAY; sm_way++)
+        {
+            if (smp_bip[cons][sm_way].valid && smp_bip[cons][sm_way].tag == full_addr / (64*LLC_SET)) {
+                break;
+            }
+        }
+
+        //miss
+        if(sm_way == LLC_WAY){
+            for (sm_way=0; sm_way<LLC_WAY; sm_way++)
+            {
+                if (smp_bip[cons][sm_way].valid == 0) {
+                    break;
+                }
+            }
+
+            if (sm_way == LLC_WAY)
+            {
+                for (sm_way=0; sm_way<LLC_WAY; sm_way++) {
+                    if (smp_bip[cons][sm_way].lru == LLC_WAY-1) {
+                        break;
+                    }
+                }
+                
+            }
+            if (sm_way == LLC_WAY) {
+            cerr << "[" << NAME << "] " << __func__ << " no victim! set: " << cons << endl;
+           // assert(0);
+            }
+
+            psel[cons].inc();
+            //cout <<"\nSAMPLE BIP MISS\n";
+
+            smp_bip[cons][sm_way].valid = 1;
+            smp_bip[cons][sm_way].tag = full_addr/(64*LLC_SET);
+
+            if(!olde)
+            {
+                for (uint32_t i=0; i<LLC_WAY; i++)
+                {
+                    if (smp_bip[cons][i].lru < smp_bip[cons][sm_way].lru)
+                    {
+                        smp_bip[cons][i].lru++;
+                    }
+                }
+                smp_bip[cons][sm_way].lru = 0 ; // promote to the MRU position
+                eps = olde + 1 % (1 << e);
+                return;
+            }
+            else
+            {
+                for (uint32_t i=0; i<LLC_WAY; i++)
+                {
+                    if (smp_bip[cons][i].lru > smp_bip[cons][sm_way].lru)
+                    {
+                        smp_bip[cons][i].lru--;
+                    }
+                }
+                smp_bip[cons][sm_way].lru = LLC_WAY - 1 ; // promote to the LRU position
+                eps = olde + 1 % (1 << e);
+                return;
+            }
+
+        }
+
+        for (uint32_t i=0; i<LLC_WAY; i++)
+        {
+            if (smp_bip[cons][i].lru < smp_bip[cons][sm_way].lru)
+            {
+                smp_bip[cons][i].lru++;
+            }
+        }
+        smp_bip[cons][sm_way].lru = 0 ; // promote to the MRU position
+    }
+
+}
+
+void CACHE::llc_replacement_final_stats()
+{
+
+    cout <<"BIP : "<<bip_cnt<<" LRU : "<<lru_cnt<<" End"<<endl;
+
+    for(int i = 0 ; i <CONS ; i++)
+    {
+        long long a = cold_bip[i].size();
+        long long b = cold_lru[i].size(); 
+        long long c = b - a;
+        cout << i << " :\t" << setw(12) << cold_lru[i].size() << "\t" << setw(12) <<  cold_bip[i].size() \
+        << "\t" << setw(12) << c << "\t"<< setw(12)  << acc[i] << "\t" << setw(12)  << lru_ctr[i] <<"\t" << setw(12) << bip_ctr[i] \
+        << "\t" << setw(12) << psel[i].swi <<"\t" << setw(12)  << lru_miss[i]<< "\t" << setw(12)  << bip_miss[i] << "\t" << setw(12)  <<hex << psel[i].cnt << dec <<endl;
+           bip_miss2[i]++;
+    }
+
+
+
+}
