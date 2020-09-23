@@ -1,4 +1,4 @@
-# CacheReplacement_CS622
+# Cache Replacement
 #### Study of State-of-the-art Cache Replacement Policies
 
 An empirical evaluation and analysis of few state-of-the-art cache replacement policies. This was a course project done during *2019 Sem-I* offering of **CS622 Advanced Computer Architecture** by *Prof. Mainak Chaudhuri*, at IIT-Kanpur.  
